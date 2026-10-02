@@ -1,0 +1,22 @@
+{
+  "name": "pi-verify",
+  "version": "0.1.0",
+  "description": "Join-surface inventory for a branch under review: new files nothing references, files no manifest delivers, schedules pointing at absent scripts, unreferenced dependencies, cross-file symbol joins.",
+  "keywords": ["pi","pi-package","pi-extension","review","verification","joins"],
+  "license": "MIT",
+  "type": "module",
+  "repository": { "type": "git", "url": "git+https://github.com/DeepakJangra239/pi-verify.git" },
+  "homepage": "https://github.com/DeepakJangra239/pi-verify#readme",
+  "bugs": { "url": "https://github.com/DeepakJangra239/pi-verify/issues" },
+  "files": ["verify.ts"],
+  "pi": { "extensions": ["./verify.ts"] },
+  "scripts": { "test": "node --experimental-strip-types test/verify.test.ts" },
+  "engines": { "node": ">=22.6.0" },
+  "peerDependencies": { "@earendil-works/pi-ai": "*", "@earendil-works/pi-coding-agent": "*", "@earendil-works/pi-tui": "*", "typebox": "*" },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.4",
+    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@earendil-works/pi-tui": "^0.84.4",
+    "typebox": "^1.3.25"
+  }
+}
