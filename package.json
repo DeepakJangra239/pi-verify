@@ -1,6 +1,6 @@
 {
   "name": "pi-verify",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Join-surface inventory for a branch under review: new files nothing references, files no manifest delivers, schedules pointing at absent scripts, unreferenced dependencies, cross-file symbol joins.",
   "keywords": ["pi","pi-package","pi-extension","review","verification","joins"],
   "license": "MIT",

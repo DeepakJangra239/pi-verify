@@ -141,6 +141,147 @@ function makeRepo(name: string, files: Record<string, string>, feature: Record<s
 	})(), "");
 }
 
+
+// ── False positives found on a real 38-file branch ───────────────────────────
+// Each case below is a false positive the first version produced against the actual repo.
+// Every one is paired with a NEGATIVE control, because a detector that fires on everything is
+// worse than no detector — and the original controls missed these precisely by using fixtures
+// with no second definition and no docs.
+
+const { isDeployableArtifact } = await import("../verify.ts");
+
+// --- manifest / unreferenced scoping: tests and docs are not deployable artefacts ---
+{
+	const dirty = makeRepo(
+		"artefacts",
+		{ "deploy.manifest": "migrations_shipped.txt\n" },
+		{
+			"migrations/003_real.sql": "x=1;\n",
+			"tests/test_thing.py": "x=1\n",
+			"docs/notes.md": "# hi\n",
+			"README.md": "hi\n",
+			".github/workflows/ci.yml": "on: push\n",
+			"conftest.py": "x=1\n",
+		},
+	);
+	const r = buildReport(dirty);
+	check("a new migration IS still flagged as a manifest gap", r.manifestGaps.includes("migrations/003_real.sql"), JSON.stringify(r.manifestGaps));
+	check(
+		"NEGATIVE: tests, docs, README, CI config and conftest are never manifest gaps",
+		!r.manifestGaps.some((f) => /^(tests\/|docs\/|\.github\/)/.test(f) || /README\.md$|conftest\.py$/.test(f)),
+		JSON.stringify(r.manifestGaps),
+	);
+	check(
+		"NEGATIVE: an empty report beats 12 false positives",
+		r.manifestGaps.length === 1,
+		`${r.manifestGaps.length} gaps: ${r.manifestGaps.join(", ")}`,
+	);
+	check(
+		"unreferenced_file uses the same scoping",
+		!r.unreferencedFiles.some((f) => f.startsWith("tests/") || f.startsWith("docs/")),
+		JSON.stringify(r.unreferencedFiles),
+	);
+	// Direct unit check on the predicate.
+	check("isDeployableArtifact rejects tests/ and docs/", !isDeployableArtifact("tests/test_x.py") && !isDeployableArtifact("docs/a.md"), "");
+	check("isDeployableArtifact accepts migrations/ and .sql", isDeployableArtifact("migrations/003_x.sql"), "");
+}
+
+// --- schedule targets: an absolute host path is not a repo path ---
+{
+	const hostPath = makeRepo(
+		"hostpath",
+		{ "app/service.py": "x=1\n" },
+		{
+			"scripts/thing.service": "[Service]\nExecStart=/home/deep/deploy/venv/bin/python -m thing\n",
+			"cron/crontab": "0 4 * * * $SCRIPTS/missing.sh\n",
+		},
+	);
+	const r = buildReport(hostPath);
+	check(
+		"NEGATIVE: an absolute ExecStart path is not reported as missing",
+		!r.brokenSchedules.some((b) => b.includes("/home/")),
+		JSON.stringify(r.brokenSchedules),
+	);
+	check("a genuinely missing repo-relative script IS still flagged", r.brokenSchedules.some((b) => b.includes("missing.sh")), JSON.stringify(r.brokenSchedules));
+}
+
+// --- external_callers: a definition is not a call ---
+// Reproduced exactly: four migrate_*.py files each define run_migration. The first version
+// counted the other three definitions as callers and invented a join that did not exist.
+{
+	const defs = makeRepo(
+		"defs",
+		{ "a.py": "def helper():\n    return 1\n" },
+		{
+			"a.py": "def helper():\n    return 2\n",
+			"b.py": "def helper():\n    return 3\n",
+			"c.py": "def helper():\n    return 4\n",
+		},
+	);
+	const r = buildReport(defs);
+	check(
+		"NEGATIVE: sibling definitions are not callers",
+		!r.joinSymbols.some((j) => j.symbol === "helper"),
+		JSON.stringify(r.joinSymbols),
+	);
+	check("NEGATIVE: and produce no external_callers finding", !r.findings.some((f) => f.kind === "external_callers"), JSON.stringify(r.findings));
+
+	// Shadowing AND importing the definer is a genuine caller — do not over-correct.
+	const shadow = makeRepo(
+		"shadow",
+		{ "lib.py": "def helper():\n    return 1\n" },
+		{
+			"lib.py": "def helper():\n    return 2\n",
+			"mid.py": "def helper():\n    return 3\nfrom lib import helper as _h\n\nprint(_h())\n",
+		},
+	);
+	const sh = buildReport(shadow);
+	check(
+		"a shadowing file that also imports the definer IS a caller",
+		sh.joinSymbols.some((j) => j.symbol === "helper" && j.callers.includes("mid.py")),
+		JSON.stringify(sh.joinSymbols),
+	);
+
+	// Positive control: a real call must still be found.
+	const called = makeRepo(
+		"called",
+		{ "a.py": "def helper():\n    return 1\n" },
+		{ "a.py": "def helper():\n    return 2\n", "b.py": "from a import helper\n\nprint(helper())\n" },
+	);
+	const c = buildReport(called);
+	check("a genuine call is still reported", c.joinSymbols.some((j) => j.symbol === "helper" && j.callers.includes("b.py")), JSON.stringify(c.joinSymbols));
+}
+
+// --- external_callers: docs are not callers, and dunders are not joins ---
+{
+	const docsy = makeRepo(
+		"docsy",
+		{ "a.py": "def helper():\n    return 1\n" },
+		{
+			"a.py": "def helper():\n    return 2\n",
+			"b.py": "from a import helper\n\nprint(helper())\n",
+			"README.md": "see helper for details\n",
+			"data.json": "{\"helper\": 1}\n",
+		},
+	);
+	const r = buildReport(docsy);
+	const j = r.joinSymbols.find((x) => x.symbol === "helper");
+	check("a real caller is found", !!j && j.callers.includes("b.py"), JSON.stringify(r.joinSymbols));
+	check(
+		"NEGATIVE: README.md and data.json are not callers",
+		!!j && !j.callers.some((c) => !/\.(py|ts|js|go|rs|rb|java|kt|cs|php|sh)$/i.test(c)),
+		JSON.stringify(j?.callers),
+	);
+
+	const dunder = makeRepo(
+		"dunder",
+		{ "pkg/__init__.py": "VALUE = 1\n" },
+		{ "pkg/__init__.py": "VALUE = 2\n", "other.py": "import pkg  # __init__ runs\n" },
+	);
+	const d = buildReport(dunder);
+	check("NEGATIVE: __init__ is not reported as a join", !d.joinSymbols.some((x) => x.symbol === "__init__"), JSON.stringify(d.joinSymbols));
+}
+
 for (const r of roots) rmSync(r, { recursive: true, force: true });
 
 if (failed > 0) {

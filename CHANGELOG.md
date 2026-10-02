@@ -8,6 +8,33 @@ Pinned installs are not moved by `pi update --extensions`. Upgrade deliberately:
 pi install git:github.com/DeepakJangra239/pi-verify@vX.Y.Z
 ```
 
+## [0.1.1] - 2026-10-03
+
+Fixes false positives found by running this against a real 38-file branch, where 12 of the
+reported items were noise. A detector that cries wolf trains the reader to skim past it, so each
+fix below is paired with a negative control.
+
+### Fixed
+
+- **Tests, docs, CI config and `conftest.py` were reported as manifest gaps.** They are never
+  meant to ship, so their absence from a manifest is not a question. `isDeployableArtifact` now
+  scopes both `manifest_gap` and `unreferenced_file` to things plausibly delivered.
+- **An absolute `ExecStart=` path was reported as a missing scheduled script.** `/home/.../venv/bin/python`
+  refers to the machine the unit runs on, not this checkout, so "not present here" was meaningless.
+  Only repo-relative targets are checked.
+- **A definition was counted as a call.** Four `migrate_*.py` files each *define* `run_migration`
+  and each call their own; the grep counted the three sibling definitions as callers and invented a
+  join. A file that defines the same name now counts only if it also imports the defining module.
+- **Docs and data files were listed as callers**, and `__init__` was reported as a join surface.
+  `CALLABLE_EXT` is now narrower than the indexing set, and dunders are skipped.
+
+### Changed
+
+- **`external_callers` is a finding only when the branch introduced the symbol.** On a branch that
+  rewrites a module nearly every symbol in it is "touched"; reporting them all turned 38 changed
+  files into 68 findings. Everything else remains in `joinSymbols` as context. Findings on that
+  branch: 68 -> 47, and now all true.
+
 ## [0.1.0] - 2026-10-02
 
 ### Added

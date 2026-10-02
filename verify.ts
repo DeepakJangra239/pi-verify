@@ -172,6 +172,18 @@ const CODE_EXT = new Set([
 	".kt", ".cs", ".php", ".sh", ".bash", ".sql", ".yaml", ".yml", ".toml", ".json",
 ]);
 
+/**
+ * Extensions whose contents can actually *call* a symbol.
+ *
+ * Deliberately narrower than CODE_EXT: manifests and data fixtures are worth indexing, but a
+ * JSON blob that mentions `helper` does not call it. Confusing the two produced callers like
+ * `data.json` and `README.md` on a real branch.
+ */
+const CALLABLE_EXT = new Set([
+	".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".rb", ".go", ".rs", ".java",
+	".kt", ".cs", ".php", ".sh", ".bash",
+]);
+
 function readText(abs: string): string | null {
 	try {
 		return readFileSync(abs, "utf8");
@@ -239,6 +251,26 @@ function declaredDeps(text: string, file: string): string[] {
 	return out;
 }
 
+// ── What counts as a deployable artefact ─────────────────────────────────────
+// A manifest gap only means something for a file that is *meant to ship*. Tests, docs and
+// data fixtures never belong in a manifest, so flagging them produced ~12 false positives on a
+// 38-file branch and trained the reader to skim past the section. A detector that cries wolf is
+// worse than no detector.
+const NEVER_DEPLOYED = [
+	/^tests?\//i, /^test\//i, /^spec\//i, /^docs?\//i, /^documentation\//i,
+	/^\.github\//i, /(^|\/)(conftest\.py|test_[^/]*|[^/]*_test\.[a-z]+|[^/]*\.test\.[a-z]+|[^/]*\.spec\.[a-z]+)$/i,
+];
+const DEPLOYED_LOCATIONS = /^(migrations?|scripts?|bin|deploy|ops|infra|terraform|helm|k8s|docker)\//i;
+const DEPLOYED_SUFFIX = /\.(sql|service|timer|sh|ps1|yaml|yml|toml)$/i;
+
+/** True when a path is plausibly shipped, so its absence from a manifest is a real question. */
+export function isDeployableArtifact(path: string): boolean {
+	const rel = path.split("\\").join("/");
+	if (NEVER_DEPLOYED.some((rx) => rx.test(rel))) return false;
+	if (DEPLOYED_LOCATIONS.test(rel)) return true;
+	return DEPLOYED_SUFFIX.test(rel);
+}
+
 export function buildReport(cwd: string): JoinReport {
 	const base = mergeBase(cwd);
 	const empty: JoinReport = {
@@ -283,6 +315,7 @@ export function buildReport(cwd: string): JoinReport {
 	// 1. A new file nothing else mentions.
 	const unreferencedFiles: string[] = [];
 	for (const f of addedFiles) {
+		if (!isDeployableArtifact(f)) continue;
 		const stem = basename(f, extname(f));
 		if (!stem || stem.length < 3) continue;
 		let refs = 0;
@@ -296,12 +329,13 @@ export function buildReport(cwd: string): JoinReport {
 		}
 	}
 
-	// 2. A new file no manifest-like file appears to cover.
+	// 2. A deployable file no manifest-like file appears to cover.
 	const manifests = [...textByFile.keys()].filter((p) => isManifestName(p));
 	const manifestGaps: string[] = [];
 	if (manifests.length > 0) {
 		const manifestText = manifests.map((p) => textByFile.get(p) ?? "").join("\n");
 		for (const f of addedFiles) {
+			if (!isDeployableArtifact(f)) continue;
 			const stem = basename(f, extname(f));
 			if (!manifestText.includes(f) && !manifestText.includes(stem)) {
 				manifestGaps.push(f);
@@ -311,14 +345,20 @@ export function buildReport(cwd: string): JoinReport {
 	}
 
 	// 3. A schedule pointing at a script that is not there.
+	//
+	// Only repo-relative targets can be checked against the repo. An absolute path is a host
+	// path — `ExecStart=/home/.../venv/bin/python` in a systemd unit refers to the machine that
+	// unit runs on, not this checkout, so "not present" is a meaningless verdict on it.
 	const brokenSchedules: string[] = [];
 	for (const s of scheduleTargets(cwd, all)) {
 		const t = s.target.replace(/^\$\{?\w+\}?\//, "");
 		if (!t || t.startsWith("http")) continue;
+		if (t.startsWith("/") || /^[A-Za-z]:[\\/]/.test(t)) continue; // host path, not a repo path
+		if (t.includes("/") && t.split("/").length > 2) continue; // e.g. a venv path baked into a unit
 		const abs = pathResolve(cwd, t);
 		if (existsSync(abs) || existsSync(pathResolve(cwd, "scripts", t)) || existsSync(pathResolve(cwd, "cron", t))) continue;
 		brokenSchedules.push(`${s.entry} -> ${s.target}`);
-		findings.push({ kind: "missing_schedule_target", subject: s.target, detail: `scheduled but not present: ${s.entry}` });
+		findings.push({ kind: "missing_schedule_target", subject: s.target, detail: `scheduled but not present in the repo: ${s.entry}` });
 	}
 
 	// 4. Symbols reachable from a changed file that other files call.
@@ -334,30 +374,55 @@ export function buildReport(cwd: string): JoinReport {
 	const joinSymbols: JoinReport["joinSymbols"] = [];
 	const seenJoins = new Set<string>();
 	for (const c of changed) {
-		if (c.binary || !CODE_EXT.has(extname(c.file).toLowerCase())) continue;
+		if (c.binary || !CALLABLE_EXT.has(extname(c.file).toLowerCase())) continue;
 		const abs = pathResolve(cwd, c.file);
 		const current = readText(abs);
 		if (current === null) continue;
 		const touchedText = addedText.get(c.file) ?? "";
 		for (const sym of definedSymbols(current)) {
-			if (!sym || sym.length < 4) continue;
+			// A dunder is not a join surface. `__init__` matching a file that happens to mention
+			// it is noise, and it crowded out the real signals on a real branch.
+			if (!sym || sym.length < 4 || /^__.*__$/.test(sym)) continue;
 			const key = `${c.file}:${sym}`;
 			if (seenJoins.has(key)) continue;
-			const rx = new RegExp(`\\b${sym.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+			const esc = sym.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			const rx = new RegExp(`\\b${esc}\\b`);
+			// A definition is not a call, and a file that defines the same name shadows it.
+			// Four `migrate_*.py` files each DEFINE `run_migration` and each call their own —
+			// the earlier grep counted the three sibling definitions as "callers" and invented a
+			// join that did not exist. A shadowing file only counts if it also imports the
+			// defining module, which is what a real cross-file call looks like.
+			const defRx = new RegExp(`(?:def|function|func|fn|class|struct|interface|type|enum|const|let|var)\\s+${esc}\\b`);
+			const stem = basename(c.file, extname(c.file));
+			const stemEsc = stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			const importRx = new RegExp(
+				`(?:from\\s+[\\w./]*${stemEsc}\\s+import|require\\s*\\(\\s*["'][^"']*${stemEsc}|import\\s+["'][^"']*${stemEsc}|from\\s+[\\w./]*${stemEsc}\\s+import\\s+[^\\n]*\\b${esc}\\b)`,
+			);
 			const callers: string[] = [];
 			for (const [p, t] of textByFile) {
 				if (p === c.file) continue;
-				if (rx.test(t)) callers.push(p);
+				// Docs and data fixtures mention symbols; they do not call them.
+				if (!CALLABLE_EXT.has(extname(p).toLowerCase())) continue;
+				if (!rx.test(t)) continue;
+				if (defRx.test(t)) {
+					// The file defines this name itself; it is a caller only if it also
+					// references the defining module.
+					if (!importRx.test(t)) continue;
+				}
+				callers.push(p);
 			}
 			if (callers.length === 0) continue;
 			seenJoins.add(key);
 			joinSymbols.push({ file: c.file, symbol: sym, callers: callers.slice(0, 6) });
-			const newlyDefined = rx.test(touchedText) && definedSymbols(touchedText).includes(sym);
-			if (newlyDefined || rx.test(touchedText)) {
+			// A finding, not just context, only when this branch INTRODUCED the symbol.
+			// On a branch that rewrites a module, nearly every symbol in it is "touched";
+			// reporting them all is what turned a 38-file branch into 68 findings.
+			const newlyDefined = definedSymbols(touchedText).includes(sym);
+			if (newlyDefined) {
 				findings.push({
 					kind: "external_callers",
 					subject: `${sym} (${c.file})`,
-					detail: `defined in a file this branch changed and called by ${callers.length} other file(s): ${callers.slice(0, 4).join(", ")}`,
+					detail: `introduced by this branch and already referenced by ${callers.length} other code file(s): ${callers.slice(0, 4).join(", ")}`,
 				});
 			}
 		}
