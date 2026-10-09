@@ -1,5 +1,5 @@
 /**
- * verify — join-surface inventory for a branch under review, for pi.
+ * verify — join-surface inventory for the scope under review, for pi.
  *
  * Why this exists
  * ---------------
@@ -16,19 +16,27 @@
  * It deliberately reports rather than fails. A noisy detector that blocks is worse
  * than no detector, and the enforcement lives in pi-goal's verification gate.
  *
+ * Scope: anchored, not branch-wide. `buildReport(cwd, baselineHead?)` unions
+ * committed-since-baseline + staged/unstaged worktree + untracked files, so edits
+ * made via bash, by hand, or by another session count. Without a baseline it falls
+ * back to the merge-base diff, then to a degraded empty report. The report always
+ * states the range it covered, so staleness is checkable instead of assumed.
+ *
  * Model-facing surface:
- *   - `verify_joins` — inventory of the branch's join surface, plus risk ranking
+ *   - `verify_joins` — inventory of the scope's join surface, ranked and capped
  *
  * Human-facing surface:
  *   - `/verify` — same, as a sidebar section when pi-sidebar is present
  */
 
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
-import { join, relative, resolve as pathResolve, basename, extname } from "node:path";
+import { join, relative, resolve as pathResolve, basename, extname, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
+import { homedir } from "node:os";
 
 const SKIP_DIRS = new Set([
 	".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build", "target",
@@ -62,24 +70,120 @@ export interface ChangedFile {
 	binary: boolean;
 }
 
+/** How the scope under review was determined. Always present, so staleness is checkable. */
+export interface ScopeInfo {
+	/** baseline = anchored at goal creation; mergebase = branch-diff fallback; worktree-only = no base; degraded = nothing determinable. */
+	kind: "baseline" | "mergebase" | "worktree-only" | "degraded";
+	/** Human-readable range, e.g. "a1b2c3d4..e5f60718 + worktree (2) + untracked (1)". */
+	range: string;
+	untrackedCount: number;
+	/** True when display lists were capped; see `withheld`. */
+	truncated: boolean;
+}
+
 export interface JoinReport {
 	repo: string;
 	base: string;
 	changedFiles: ChangedFile[];
 	addedFiles: string[];
-	/** New files nothing else in the repo mentions. */
+	/** New files nothing else in the repo references (via an import edge). */
 	unreferencedFiles: string[];
 	/** New files that no manifest-like file appears to cover. */
 	manifestGaps: string[];
 	/** Scheduled entries whose target script does not exist. */
 	brokenSchedules: string[];
-	/** Symbols this branch newly exposes that other files already call. */
+	/** Symbols this scope newly exposes that other files reference through an import edge. */
 	joinSymbols: { file: string; symbol: string; callers: string[] }[];
-	/** Dependency declarations nothing on the branch imports. */
+	/** Dependency declarations nothing in the repo imports. */
 	unreferencedDependencies: string[];
 	findings: Finding[];
-	/** True when nothing could be determined (not a repo, no base). */
+	/** True when nothing could be determined (not a repo, no base, no worktree changes). */
 	degraded: boolean;
+	scope: ScopeInfo;
+	/** Non-shipped-role definers withheld from joinSymbols (count only, not findings). */
+	withheldNonShipped: number;
+	/** Join-symbol entries withheld by the display cap (count only). */
+	withheldCapped: number;
+	/** Shape flags: which detector families applied to this repo. */
+	shape: { hasManifests: boolean; hasSchedules: boolean };
+}
+
+/** Cap on displayed join-symbol entries. The rest are counted in `withheldCapped`, not dropped silently. */
+export const MAX_JOIN_SYMBOLS = 15;
+
+/**
+ * Generic non-shipped roles, matched by path segment — deliberately NOT a list of
+ * directory names, because user directory names are unknowable. A segment matches
+ * when it is exactly (case-insensitive, plural-tolerant) one of these role words,
+ * or starts with `test`/`spec` (test_*, tests, specs), or is a dot-dir. Users extend
+ * or override via `verify.json` (`excludeRoles` adds regexes, `includePaths` forces
+ * inclusion). Anything unmatched here is treated as shippable code.
+ */
+const NONSHIPPED_SEGMENTS = new Set([
+	"test", "tests", "spec", "specs", "testing",
+	"doc", "docs", "documentation", "note", "notes",
+	"evidence", "example", "examples", "fixture", "fixtures",
+	"mock", "mocks", "proof", "proofs", "research", "design",
+	"demo", "demos", "sample", "samples", "sandbox", "scratch", "tmp",
+]);
+const NONSHIPPED_FILES = [
+	/(^|\/)(conftest\.py|test_[^/]*|[^/]*[._-]test\.[a-z]+|[^/]*\.test\.[a-z]+|[^/]*\.spec\.[a-z]+)$/i,
+	/(^|\/)README(\.[a-z]+)?$/i,
+];
+
+export interface VerifyConfig {
+	excludeRoles: string[];
+	includePaths: string[];
+}
+
+function agentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+}
+
+/** User overrides from `<cwd>/.pi/verify.json`, then the global agent dir. Invalid regexes are ignored. */
+export function loadVerifyConfig(cwd: string): VerifyConfig {
+	const out: VerifyConfig = { excludeRoles: [], includePaths: [] };
+	for (const p of [join(agentDir(), "verify.json"), join(cwd, CONFIG_DIR_NAME, "verify.json")]) {
+		if (!existsSync(p)) continue;
+		try {
+			const j = JSON.parse(readFileSync(p, "utf8"));
+			if (Array.isArray(j.excludeRoles)) for (const r of j.excludeRoles) if (typeof r === "string" && r) out.excludeRoles.push(r);
+			if (Array.isArray(j.includePaths)) for (const r of j.includePaths) if (typeof r === "string" && r) out.includePaths.push(r);
+		} catch {
+			/* malformed — ignore */
+		}
+	}
+	return out;
+}
+
+/** True when a repo-relative path plays a non-shipped role (test, doc, evidence, fixture, dot-dir, generated). */
+export function isNonShipped(relPath: string, cfg?: VerifyConfig): boolean {
+	const rel = relPath.split("\\").join("/");
+	const config = cfg ?? { excludeRoles: [], includePaths: [] };
+	for (const inc of config.includePaths) {
+		try {
+			if (new RegExp(inc, "i").test(rel)) return false;
+		} catch {
+			/* ignore bad regex */
+		}
+	}
+	const segments = rel.split("/");
+	for (const seg of segments) {
+		const s = seg.toLowerCase();
+		if (s.startsWith(".")) return true;
+		const singular = s.endsWith("s") ? s.slice(0, -1) : s;
+		if (NONSHIPPED_SEGMENTS.has(s) || NONSHIPPED_SEGMENTS.has(singular)) return true;
+		if (/^(test|spec)/i.test(s)) return true;
+	}
+	if (NONSHIPPED_FILES.some((rx) => rx.test(rel))) return true;
+	for (const pat of config.excludeRoles) {
+		try {
+			if (new RegExp(pat, "i").test(rel)) return true;
+		} catch {
+			/* ignore bad regex */
+		}
+	}
+	return false;
 }
 
 function git(cwd: string, args: string[]): string | null {
@@ -120,19 +224,83 @@ export function mergeBase(cwd: string): string {
 }
 
 export function changedFilesOf(cwd: string, base: string): ChangedFile[] {
-	const out = git(cwd, ["diff", "--numstat", `${base}...HEAD`]);
+	return scopeRows(cwd, base).rows;
+}
+
+interface ScopeRows {
+	rows: ChangedFile[];
+	addedFiles: string[];
+	untracked: string[];
+	worktreeFiles: string[];
+}
+
+/** Parse `git diff --numstat` output into rows. Binary files report "-". */
+function parseNumstat(out: string | null): ChangedFile[] {
 	if (out === null) return [];
 	const rows: ChangedFile[] = [];
 	for (const line of out.split("\n")) {
 		const parts = line.split("\t");
 		if (parts.length < 3) continue;
 		const file = parts[2]!.trim();
+		if (!file) continue;
 		const a = Number(parts[0]);
 		const d = Number(parts[1]);
-		// Git prints "-" for binary files; Number("-") is NaN, which is the signal.
 		rows.push({ file, added: a, removed: d, binary: !Number.isFinite(a) || !Number.isFinite(d) });
 	}
 	return rows;
+}
+
+/**
+ * Anchored scope rows: `git diff <base>` (no HEAD) covers committed-since-base
+ * AND staged/unstaged worktree in one shot. `git diff HEAD` is read separately
+ * — never merged — so the scope label can state the worktree part on its own.
+ */
+function scopeRows(cwd: string, base: string): ScopeRows {
+	const merged = new Map<string, ChangedFile>();
+	for (const r of parseNumstat(git(cwd, ["diff", "--numstat", base]))) {
+		merged.set(r.file, { ...r });
+	}
+	const worktreeFiles = parseNumstat(git(cwd, ["diff", "--numstat", "HEAD"])).map((r) => r.file);
+	const untracked = untrackedFiles(cwd);
+	for (const f of untracked) {
+		if (!merged.has(f)) merged.set(f, { file: f, added: 0, removed: 0, binary: false });
+	}
+	const addedCommitted = git(cwd, ["diff", "--diff-filter=A", "--name-only", `${base}...HEAD`])?.split("\n").map((l) => l.trim()).filter(Boolean) ?? [];
+	const addedWorktree = git(cwd, ["diff", "--diff-filter=A", "--name-only", "HEAD"])?.split("\n").map((l) => l.trim()).filter(Boolean) ?? [];
+	const addedFiles = [...new Set([...addedCommitted, ...addedWorktree, ...untracked])];
+	return { rows: [...merged.values()], addedFiles, untracked, worktreeFiles };
+}
+
+/** Untracked, non-ignored files, repo-relative. Empty outside a repo. */
+export function untrackedFiles(cwd: string): string[] {
+	const out = git(cwd, ["ls-files", "--others", "--exclude-standard"]);
+	if (out === null) return [];
+	return out.split("\n").map((l) => l.trim()).filter(Boolean);
+}
+
+/** Short human label for the resolved scope. */
+function scopeRangeLabel(scope: { base: string; kind: ScopeInfo["kind"] }, worktreeCount: number, untrackedCount: number): string {
+	if (scope.kind === "degraded") return "nothing determinable";
+	if (scope.kind === "worktree-only") return `worktree vs HEAD (${worktreeCount}) + untracked (${untrackedCount})`;
+	const short = scope.base.slice(0, 8);
+	const wt = worktreeCount ? ` + worktree (${worktreeCount})` : "";
+	const ut = untrackedCount ? ` + untracked (${untrackedCount})` : "";
+	return scope.kind === "baseline" ? `${short}..HEAD${wt}${ut}` : `${short}...HEAD${wt}${ut} (branch fallback)`;
+}
+/**
+ * Resolve the review scope: anchored at `baselineHead` when given and still
+ * resolvable (covers N commits on one branch), else the merge-base fallback,
+ * else worktree-only, else degraded. Shared shape with pi-goal's scope logic.
+ */
+export function resolveScope(cwd: string, baselineHead?: string): { base: string; kind: ScopeInfo["kind"] } {
+	if (baselineHead && git(cwd, ["cat-file", "-e", baselineHead]) !== null) {
+		return { base: baselineHead, kind: "baseline" };
+	}
+	const base = mergeBase(cwd);
+	if (base) return { base, kind: "mergebase" };
+	// No base, but a repo with worktree content is still reviewable.
+	if (git(cwd, ["rev-parse", "--is-inside-work-tree"]) !== null) return { base: "", kind: "worktree-only" };
+	return { base: "", kind: "degraded" };
 }
 
 /** Repo files to search, skipping vendored and generated trees. */
@@ -192,21 +360,57 @@ function readText(abs: string): string | null {
 	}
 }
 
-/** Symbols a file's added lines newly define. */
-function definedSymbols(addedText: string): string[] {
+/**
+ * High-collision generic identifiers. Matching these across a repo produces
+ * word-collision noise (`data`, `status`, `main` in every file), never a join.
+ * Withheld from the ranked display and never reported as findings.
+ */
+const GENERIC_SYMBOLS = new Set([
+	"main", "seed", "data", "status", "today", "time", "date", "message", "body",
+	"kind", "next", "match", "state", "detail", "result", "total", "params", "type",
+	"index", "target", "label", "text", "html", "live", "diff", "capture", "run",
+	"value", "item", "items", "name", "id", "ref", "refs",
+]);
+
+/**
+ * Symbols a file's text actually *exports* — not every local it mentions.
+ * Python: top-level (column-0) def/class only. JS/TS: `export ...` declarations,
+ * `export { a, b }` lists, and `module.exports`/`exports.x` forms. Other
+ * languages keep the generic declaration match. Locals (`const data = ...`
+ * without export, indented defs) are never join surface.
+ */
+export function exportedSymbols(text: string, file: string): string[] {
 	const out = new Set<string>();
-	const rx = /^\s*(?:export\s+)?(?:default\s+)?(?:public\s+|private\s+|protected\s+|static\s+|async\s+)*(?:def|function|func|fn|class|struct|interface|type|enum|const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)/gm;
-	for (const m of addedText.matchAll(rx)) out.add(m[1]!);
+	const ext = extname(file).toLowerCase();
+	if (ext === ".py") {
+		for (const m of text.matchAll(/^(?:async\s+)?(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)/gm)) out.add(m[1]!);
+		return [...out];
+	}
+	if (ext === ".ts" || ext === ".tsx" || ext === ".js" || ext === ".jsx" || ext === ".mjs" || ext === ".cjs") {
+		for (const m of text.matchAll(/export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var|enum|interface|type)\s+([A-Za-z_$][A-Za-z0-9_$]*)/g)) out.add(m[1]!);
+		for (const m of text.matchAll(/export\s*\{([^}]+)\}/g)) {
+			for (const part of (m[1] ?? "").split(",")) {
+				const name = part.trim().split(/\s+as\s+/).pop()?.trim().replace(/[^A-Za-z0-9_$]/g, "");
+				if (name) out.add(name);
+			}
+		}
+		for (const m of text.matchAll(/module\.exports\s*=\s*\{([^}]+)\}/g)) {
+			for (const part of (m[1] ?? "").split(",")) {
+				const name = part.trim().split(/[:\s]/)[0]?.trim().replace(/[^A-Za-z0-9_$]/g, "");
+				if (name) out.add(name);
+			}
+		}
+		for (const m of text.matchAll(/exports\.([A-Za-z_$][A-Za-z0-9_$]*)/g)) out.add(m[1]!);
+		return [...out];
+	}
+	for (const m of text.matchAll(/^\s*(?:export\s+)?(?:default\s+)?(?:public\s+|private\s+|protected\s+|static\s+|async\s+)*(?:def|function|func|fn|class|struct|interface|type|enum|const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)/gm)) out.add(m[1]!);
 	return [...out];
 }
 
 /** Crontab / systemd / CI schedule entries and the paths they point at. */
 function scheduleTargets(cwd: string, files: string[]): { entry: string; target: string }[] {
 	const out: { entry: string; target: string }[] = [];
-	const schedLike = (f: string) =>
-		/(^|\/)(crontab|cron|.*\.timer|.*\.cron|.*\.service)$/i.test(f) ||
-		/(\.github\/workflows\/.*\.ya?ml)$/i.test(f) ||
-		/(^|\/)(crontab|.*\.cron)$/i.test(basename(f));
+	const schedLike = (f: string) => isScheduleLike(f) || isScheduleLike(basename(f));
 	for (const abs of files) {
 		const rel = relative(cwd, abs);
 		if (!schedLike(rel)) continue;
@@ -231,7 +435,7 @@ function scheduleTargets(cwd: string, files: string[]): { entry: string; target:
 	return out;
 }
 
-/** Dependency names declared by a manifest-ish file. */
+/** Dependency names declared by a manifest-ish file. Python/JS plus Go/Rust/TOML/Ruby. */
 function declaredDeps(text: string, file: string): string[] {
 	const out: string[] = [];
 	const f = basename(file).toLowerCase();
@@ -247,54 +451,118 @@ function declaredDeps(text: string, file: string): string[] {
 				for (const pm of (m[1] ?? "").matchAll(/"([^"]+)"\s*:/g)) out.push(pm[1]!);
 			}
 		}
+	} else if (f === "go.mod") {
+		for (const m of text.matchAll(/^\s*(?:require\s+)?([a-z0-9][a-z0-9./_-]*)\s+v\d/gm)) out.push(m[1]!);
+	} else if (f === "cargo.toml") {
+		const section = text.match(/\[dependencies\][\s\S]*?(?=\n\[|\s*$)/);
+		if (section) for (const m of section[0].matchAll(/^\s*([A-Za-z0-9_-]+)\s*=/gm)) out.push(m[1]!);
+	} else if (f === "pyproject.toml") {
+		const section = text.match(/dependencies\s*=\s*\[([\s\S]*?)\]/);
+		if (section) for (const m of (section[1] ?? "").matchAll(/["']([A-Za-z0-9_.-]+)/g)) out.push(m[1]!);
+	} else if (f === "gemfile") {
+		for (const m of text.matchAll(/^\s*gem\s+["']([A-Za-z0-9_.-]+)["']/gm)) out.push(m[1]!);
 	}
 	return out;
 }
 
+const DEP_FILES = new Set(["requirements.txt", "package.json", "go.mod", "cargo.toml", "pyproject.toml", "gemfile"]);
+
 // ── What counts as a deployable artefact ─────────────────────────────────────
-// A manifest gap only means something for a file that is *meant to ship*. Tests, docs and
-// data fixtures never belong in a manifest, so flagging them produced ~12 false positives on a
-// 38-file branch and trained the reader to skim past the section. A detector that cries wolf is
-// worse than no detector.
-const NEVER_DEPLOYED = [
-	/^tests?\//i, /^test\//i, /^spec\//i, /^docs?\//i, /^documentation\//i,
-	/^\.github\//i, /(^|\/)(conftest\.py|test_[^/]*|[^/]*_test\.[a-z]+|[^/]*\.test\.[a-z]+|[^/]*\.spec\.[a-z]+)$/i,
-];
+// A manifest gap only means something for a file that is *meant to ship*.
+// Non-shipped roles (tests, docs, evidence, fixtures — matched generically via
+// isNonShipped, user-overridable in verify.json) never belong in a manifest, so
+// flagging them trained the reader to skim past the section. A detector that
+// cries wolf is worse than no detector.
 const DEPLOYED_LOCATIONS = /^(migrations?|scripts?|bin|deploy|ops|infra|terraform|helm|k8s|docker)\//i;
 const DEPLOYED_SUFFIX = /\.(sql|service|timer|sh|ps1|yaml|yml|toml)$/i;
 
 /** True when a path is plausibly shipped, so its absence from a manifest is a real question. */
 export function isDeployableArtifact(path: string): boolean {
 	const rel = path.split("\\").join("/");
-	if (NEVER_DEPLOYED.some((rx) => rx.test(rel))) return false;
+	if (isNonShipped(rel)) return false;
 	if (DEPLOYED_LOCATIONS.test(rel)) return true;
 	return DEPLOYED_SUFFIX.test(rel);
 }
 
-export function buildReport(cwd: string): JoinReport {
-	const base = mergeBase(cwd);
+/** Repo-shape probe: which detector families apply here at all. */
+function detectShape(cwd: string, textByFile: Map<string, string>): { hasManifests: boolean; hasSchedules: boolean } {
+	const isManifestName = (p: string) => MANIFEST_HINTS.some((h) => basename(p).toLowerCase().includes(h));
+	const hasManifests = [...textByFile.keys()].some((p) => isManifestName(p));
+	const hasSchedules =
+		[...textByFile.keys()].some((p) => isScheduleLike(p)) ||
+		["migrations", "migrate", "cron", "deploy", "ops", "infra", ".github"].some((d) => {
+			try {
+				return statSync(join(cwd, d)).isDirectory();
+			} catch {
+				return false;
+			}
+		});
+	return { hasManifests, hasSchedules };
+}
+
+/** Schedule-like file by name (cron, systemd, workflow). Extracted for shape probing. */
+function isScheduleLike(rel: string): boolean {
+	return (
+		/(^|\/)(crontab|cron|.*\.timer|.*\.cron|.*\.service)$/i.test(rel) ||
+		/(\.github\/workflows\/.*\.ya?ml)$/i.test(rel) ||
+		/(^|\/)(crontab|.*\.cron)$/i.test(basename(rel))
+	);
+}
+
+/** Import-edge matcher: does `text` import the module `stem` (any language form)? */
+function importRxFor(stem: string): RegExp {
+	const esc = stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp(
+		`(?:from\\s+["']?[\\w./-]*${esc}\\b|import\\s+[^;\\n]*${esc}|require\\s*\\(\\s*["'][^"']*${esc})`,
+	);
+}
+
+/** True when a manifest covers file `f`: full path, stem, or any ancestor directory is named. */
+function manifestCovers(manifestText: string, f: string): boolean {
+	if (manifestText.includes(f)) return true;
+	const stem = basename(f, extname(f));
+	if (stem && manifestText.includes(stem)) return true;
+	const segs = f.split("/");
+	for (let k = segs.length - 1; k >= 1; k--) {
+		const dir = segs.slice(0, k).join("/") + "/";
+		if (manifestText.includes(dir)) return true;
+	}
+	return false;
+}
+
+export function buildReport(cwd: string, baselineHead?: string): JoinReport {
+	const scope = resolveScope(cwd, baselineHead);
+	const cfg = loadVerifyConfig(cwd);
 	const empty: JoinReport = {
-		repo: cwd, base: "", changedFiles: [], addedFiles: [], unreferencedFiles: [], manifestGaps: [],
+		repo: cwd, base: scope.base, changedFiles: [], addedFiles: [], unreferencedFiles: [], manifestGaps: [],
 		brokenSchedules: [], joinSymbols: [], unreferencedDependencies: [], findings: [], degraded: true,
+		scope: { kind: scope.kind, range: scopeRangeLabel(scope, 0, 0), untrackedCount: 0, truncated: false },
+		withheldNonShipped: 0, withheldCapped: 0, shape: { hasManifests: false, hasSchedules: false },
 	};
-	if (!base) return empty;
+	if (scope.kind === "degraded") return empty;
 
-	const changed = changedFilesOf(cwd, base);
-	if (!changed.length) return { ...empty, base, degraded: false };
+	const workBase = scope.kind === "worktree-only" ? "HEAD" : scope.base;
+	const { rows: changed, addedFiles, untracked, worktreeFiles } = scopeRows(cwd, workBase);
+	if (!changed.length) {
+		return {
+			...empty, base: scope.base, degraded: false,
+			scope: { kind: scope.kind, range: scopeRangeLabel(scope, worktreeFiles.length, untracked.length), untrackedCount: untracked.length, truncated: false },
+		};
+	}
 
-	const addedFiles = git(cwd, ["diff", "--diff-filter=A", "--name-only", `${base}...HEAD`])?.split("\n").map((l) => l.trim()).filter(Boolean) ?? [];
-
-	// Everything searchable, and the added lines per changed file.
+	// Everything searchable, and the added lines per changed file. Untracked files
+	// have no diff — their full content is the added surface.
 	const all = walk(cwd);
 	const addedText = new Map<string, string>();
 	for (const c of changed) {
 		if (c.binary) continue;
-		const d = git(cwd, ["diff", "--unified=0", `${base}...HEAD`, "--", c.file]);
-		if (d === null) continue;
-		addedText.set(
-			c.file,
-			d.split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++")).map((l) => l.slice(1)).join("\n"),
-		);
+		const d = scope.kind === "worktree-only" ? null : git(cwd, ["diff", "--unified=0", `${scope.base}`, "--", c.file]);
+		const lines = d === null ? [] : d.split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++")).map((l) => l.slice(1));
+		if (!lines.length && addedFiles.includes(c.file)) {
+			const t = readText(pathResolve(cwd, c.file));
+			if (t !== null) lines.push(...t.split("\n"));
+		}
+		addedText.set(c.file, lines.join("\n"));
 	}
 
 	// Index searchable text once, keyed by repo-relative path. Manifest-like files are
@@ -312,32 +580,38 @@ export function buildReport(cwd: string): JoinReport {
 
 	const findings: Finding[] = [];
 
-	// 1. A new file nothing else mentions.
+	// 1. A new file nothing else references — via an import edge or a path mention.
+	// A bare word-match is not a reference (it produced callers like `data.json`
+	// for a symbol named `data`); the referrer must import the file's module or
+	// name its path.
 	const unreferencedFiles: string[] = [];
 	for (const f of addedFiles) {
 		if (!isDeployableArtifact(f)) continue;
 		const stem = basename(f, extname(f));
 		if (!stem || stem.length < 3) continue;
+		const wordRx = new RegExp(`\\b${stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+		const edgeRx = importRxFor(stem);
 		let refs = 0;
 		for (const [p, t] of textByFile) {
 			if (p === f) continue;
-			if (t.includes(f) || new RegExp(`\\b${stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(t)) refs++;
+			if (t.includes(f) || (wordRx.test(t) && edgeRx.test(t))) refs++;
 		}
 		if (refs === 0) {
 			unreferencedFiles.push(f);
-			findings.push({ kind: "unreferenced_file", subject: f, detail: "added on this branch and referenced by nothing else in the repo" });
+			findings.push({ kind: "unreferenced_file", subject: f, detail: "added in this scope and referenced by nothing else in the repo" });
 		}
 	}
 
-	// 2. A deployable file no manifest-like file appears to cover.
-	const manifests = [...textByFile.keys()].filter((p) => isManifestName(p));
+	// 2. A deployable file no manifest-like file appears to cover. Coverage is by
+	// path, stem, or ancestor directory — a manifest that ships a whole static dir
+	// covers the new fonts inside it. Runs only when manifests exist (shape-gated).
+	const manifests = [...textByFile.keys()].filter((p) => MANIFEST_HINTS.some((h) => basename(p).toLowerCase().includes(h)));
 	const manifestGaps: string[] = [];
 	if (manifests.length > 0) {
 		const manifestText = manifests.map((p) => textByFile.get(p) ?? "").join("\n");
 		for (const f of addedFiles) {
 			if (!isDeployableArtifact(f)) continue;
-			const stem = basename(f, extname(f));
-			if (!manifestText.includes(f) && !manifestText.includes(stem)) {
+			if (!manifestCovers(manifestText, f)) {
 				manifestGaps.push(f);
 				findings.push({ kind: "manifest_gap", subject: f, detail: `added, but no manifest (${manifests.length} found) mentions it — is it delivered?` });
 			}
@@ -361,80 +635,81 @@ export function buildReport(cwd: string): JoinReport {
 		findings.push({ kind: "missing_schedule_target", subject: s.target, detail: `scheduled but not present in the repo: ${s.entry}` });
 	}
 
-	// 4. Symbols reachable from a changed file that other files call.
+	// 4. Symbols this scope newly exposes that other files reference through an
+	// import edge.
 	//
 	// Read the changed file's *current* content rather than only its added lines: the join
 	// that matters is often a symbol whose definition did not move but whose file now sits on
 	// a new call path. Restricted to added lines, it misses exactly that case.
 	//
-	// `joinSymbols` is CONTEXT — the changed file's exposed surface. Only symbols this branch
-	// actually touched (mentioned in its own added lines, or newly defined by it) become
-	// findings; a changed file that merely exports something old callers use is not a defect,
-	// and reporting it as one is how a detector becomes noise.
-	const joinSymbols: JoinReport["joinSymbols"] = [];
+	// Three precision rules keep this from becoming word-collision noise:
+	// exports-only (a `const data = ...` local is not join surface), import-edge
+	// callers (mentioning a name is not calling it), and generic-name suppression.
+	// Non-shipped roles (tests, docs, evidence — matched generically, see
+	// isNonShipped) are withheld as definers and counted, not reported.
+	// `allJoins` is context; only scope-INTRODUCED symbols become findings, ranked
+	// (introduced first, then caller count) and capped at MAX_JOIN_SYMBOLS.
+	const allJoins: { file: string; symbol: string; callers: string[]; introduced: boolean }[] = [];
 	const seenJoins = new Set<string>();
+	let withheldNonShipped = 0;
 	for (const c of changed) {
 		if (c.binary || !CALLABLE_EXT.has(extname(c.file).toLowerCase())) continue;
+		if (isNonShipped(c.file, cfg)) {
+			const t = readText(pathResolve(cwd, c.file));
+			if (t !== null) withheldNonShipped += exportedSymbols(t, c.file).filter((s) => s && s.length >= 4 && !/^__.*__$/.test(s) && !GENERIC_SYMBOLS.has(s)).length;
+			continue;
+		}
 		const abs = pathResolve(cwd, c.file);
 		const current = readText(abs);
 		if (current === null) continue;
 		const touchedText = addedText.get(c.file) ?? "";
-		for (const sym of definedSymbols(current)) {
-			// A dunder is not a join surface. `__init__` matching a file that happens to mention
-			// it is noise, and it crowded out the real signals on a real branch.
-			if (!sym || sym.length < 4 || /^__.*__$/.test(sym)) continue;
+		const introducedSet = new Set(exportedSymbols(touchedText, c.file));
+		for (const sym of exportedSymbols(current, c.file)) {
+			// A dunder is not a join surface, and neither is a generic name that
+			// collides across every file in the repo.
+			if (!sym || sym.length < 4 || /^__.*__$/.test(sym) || GENERIC_SYMBOLS.has(sym)) continue;
 			const key = `${c.file}:${sym}`;
 			if (seenJoins.has(key)) continue;
 			const esc = sym.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 			const rx = new RegExp(`\\b${esc}\\b`);
-			// A definition is not a call, and a file that defines the same name shadows it.
-			// Four `migrate_*.py` files each DEFINE `run_migration` and each call their own —
-			// the earlier grep counted the three sibling definitions as "callers" and invented a
-			// join that did not exist. A shadowing file only counts if it also imports the
-			// defining module, which is what a real cross-file call looks like.
-			const defRx = new RegExp(`(?:def|function|func|fn|class|struct|interface|type|enum|const|let|var)\\s+${esc}\\b`);
+			// A definition is not a call. A file only counts as a caller when it
+			// references the defining module through an import edge — a bare
+			// mention without one is not a call.
 			const stem = basename(c.file, extname(c.file));
-			const stemEsc = stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-			const importRx = new RegExp(
-				`(?:from\\s+[\\w./]*${stemEsc}\\s+import|require\\s*\\(\\s*["'][^"']*${stemEsc}|import\\s+["'][^"']*${stemEsc}|from\\s+[\\w./]*${stemEsc}\\s+import\\s+[^\\n]*\\b${esc}\\b)`,
-			);
+			const edgeRx = importRxFor(stem);
 			const callers: string[] = [];
 			for (const [p, t] of textByFile) {
 				if (p === c.file) continue;
 				// Docs and data fixtures mention symbols; they do not call them.
 				if (!CALLABLE_EXT.has(extname(p).toLowerCase())) continue;
 				if (!rx.test(t)) continue;
-				if (defRx.test(t)) {
-					// The file defines this name itself; it is a caller only if it also
-					// references the defining module.
-					if (!importRx.test(t)) continue;
-				}
+				if (!edgeRx.test(t)) continue;
 				callers.push(p);
 			}
 			if (callers.length === 0) continue;
 			seenJoins.add(key);
-			joinSymbols.push({ file: c.file, symbol: sym, callers: callers.slice(0, 6) });
-			// A finding, not just context, only when this branch INTRODUCED the symbol.
-			// On a branch that rewrites a module, nearly every symbol in it is "touched";
-			// reporting them all is what turned a 38-file branch into 68 findings.
-			const newlyDefined = definedSymbols(touchedText).includes(sym);
-			if (newlyDefined) {
-				findings.push({
-					kind: "external_callers",
-					subject: `${sym} (${c.file})`,
-					detail: `introduced by this branch and already referenced by ${callers.length} other code file(s): ${callers.slice(0, 4).join(", ")}`,
-				});
-			}
+			allJoins.push({ file: c.file, symbol: sym, callers, introduced: introducedSet.has(sym) });
 		}
 	}
+	allJoins.sort((a, b) => Number(b.introduced) - Number(a.introduced) || b.callers.length - a.callers.length);
+	const withheldCapped = Math.max(0, allJoins.length - MAX_JOIN_SYMBOLS);
+	const joinSymbols: JoinReport["joinSymbols"] = allJoins.slice(0, MAX_JOIN_SYMBOLS).map(({ file, symbol, callers }) => ({ file, symbol, callers: callers.slice(0, 6) }));
+	for (const j of allJoins.slice(0, MAX_JOIN_SYMBOLS)) {
+		if (!j.introduced) continue;
+		findings.push({
+			kind: "external_callers",
+			subject: `${j.symbol} (${j.file})`,
+			detail: `introduced in this scope and already referenced by ${j.callers.length} other code file(s): ${j.callers.slice(0, 4).join(", ")}`,
+		});
+	}
 
-	// 5. A dependency declared but imported nowhere on the branch.
+	// 5. A dependency declared but imported nowhere in the repo.
 	const unreferencedDependencies: string[] = [];
 	const declared = new Map<string, string>();
 	const declaringFiles = new Set<string>();
 	for (const [p, t] of textByFile) {
 		const base = basename(p).toLowerCase();
-		if (base === "requirements.txt" || base === "package.json") {
+		if (DEP_FILES.has(base)) {
 			const deps = declaredDeps(t, p);
 			if (deps.length === 0) continue;
 			declaringFiles.add(p);
@@ -459,17 +734,21 @@ export function buildReport(cwd: string): JoinReport {
 		}
 	}
 
+	const shape = detectShape(cwd, textByFile);
+	const truncated = withheldCapped > 0;
 	return {
-		repo: cwd, base, changedFiles: changed, addedFiles, unreferencedFiles, manifestGaps,
+		repo: cwd, base: scope.base, changedFiles: changed, addedFiles, unreferencedFiles, manifestGaps,
 		brokenSchedules, joinSymbols, unreferencedDependencies, findings, degraded: false,
+		scope: { kind: scope.kind, range: scopeRangeLabel(scope, worktreeFiles.length, untracked.length), untrackedCount: untracked.length, truncated },
+		withheldNonShipped, withheldCapped, shape,
 	};
 }
 
 function render(report: JoinReport): string {
-	if (report.degraded) return "verify: no git branch diff is determinable here, so there is nothing to inventory.";
-	if (!report.changedFiles.length) return "verify: the branch has no changes against its merge base.";
+	if (report.degraded) return "verify: no review scope is determinable here (not a repo, no baseline, no worktree changes), so there is nothing to inventory.";
+	if (!report.changedFiles.length) return "verify: the review scope has no changes.";
 	const lines = [
-		`verify — join surface of this branch (${report.changedFiles.length} changed file(s), ${report.addedFiles.length} added)`,
+		`verify — join surface of this scope (${report.changedFiles.length} changed file(s), ${report.addedFiles.length} added; scope ${report.scope.range})`,
 		"",
 	];
 	const section = (title: string, items: string[]) => {
@@ -478,14 +757,31 @@ function render(report: JoinReport): string {
 		for (const i of items) lines.push(`  - ${i}`);
 		lines.push("");
 	};
-	section("New files nothing else in the repo references", report.unreferencedFiles);
-	section("New files no manifest appears to deliver", report.manifestGaps);
-	section("Scheduled entries pointing at something absent", report.brokenSchedules);
-	section("Dependencies declared but not imported on this branch", report.unreferencedDependencies);
-	section("Symbols this branch defines that other files already call", report.joinSymbols.map((j) => `${j.symbol} in ${j.file} — called by ${j.callers.join(", ")}`));
+	section("New files nothing else in the repo references (import edge or path)", report.unreferencedFiles);
+	if (report.shape.hasManifests) {
+		section("New files no manifest appears to deliver", report.manifestGaps);
+	} else {
+		lines.push("Manifest coverage: not applicable to this repo shape (no manifests found).");
+		lines.push("");
+	}
+	if (report.shape.hasSchedules || report.brokenSchedules.length) {
+		section("Scheduled entries pointing at something absent", report.brokenSchedules);
+	} else {
+		lines.push("Schedules: not applicable to this repo shape (no schedules found).");
+		lines.push("");
+	}
+	section("Dependencies declared but imported nowhere", report.unreferencedDependencies);
+	section("Symbols this scope exposes that other files reference (import edge)", report.joinSymbols.map((j) => `${j.symbol} in ${j.file} — referenced by ${j.callers.join(", ")}`));
+	if (report.withheldNonShipped > 0) {
+		lines.push(`Withheld: ${report.withheldNonShipped} symbol(s) in non-shipped roles (tests, docs, evidence, fixtures) — counted, not reported.`);
+	}
+	if (report.withheldCapped > 0) {
+		lines.push(`Withheld: ${report.withheldCapped} further symbol(s) beyond the top ${MAX_JOIN_SYMBOLS} — ranked by introduced-first, caller count.`);
+	}
+	if (lines.length && (report.withheldNonShipped > 0 || report.withheldCapped > 0)) lines.push("");
 	if (!report.findings.length) {
 		lines.push("No join-surface gaps found. That is not a clean bill of health: these are mechanical checks only.");
-		lines.push("Still work the six questions — clock, empty results, partial failure, absent dependency, delivery path.");
+		lines.push("Still work the review questions — correctness, architecture, complexity, quality, dev-test evidence.");
 	} else {
 		lines.push(`${report.findings.length} item(s) above. Treat them as questions to answer, not as verdicts:`);
 		lines.push("an unreferenced new file may be legitimately standalone, and a broken schedule may be a template.");
@@ -493,7 +789,9 @@ function render(report: JoinReport): string {
 	return lines.join("\n");
 }
 
-const VerifyJoinsParams = Type.Object({});
+const VerifyJoinsParams = Type.Object({
+	baselineHead: Type.Optional(Type.String({ description: "Goal baseline SHA: scope anchored at goal creation (covers N commits + worktree + untracked)" })),
+});
 
 export default function (pi: ExtensionAPI) {
 	let last: JoinReport | null = null;
@@ -502,15 +800,16 @@ export default function (pi: ExtensionAPI) {
 		name: "verify_joins",
 		label: "Verify Joins",
 		description:
-			"Inventory the join surface of the current branch: new files nothing references, new files no " +
-			"manifest delivers, schedules pointing at absent scripts, dependencies nothing imports, and symbols " +
-			"this branch defines that other files already call. Use it at the start of a review round to learn " +
-			"where the risk is. It reports; it does not judge, and it never fails the call — a finding is a " +
-			"question to answer, not a verdict.",
-		promptSnippet: "Inventory the current branch's join surface before reviewing it",
+			"Inventory the join surface of the current review scope (anchored at the goal baseline when " +
+			"given, else the merge-base fallback): new files nothing references, new files no manifest delivers, " +
+			"schedules pointing at absent scripts, dependencies nothing imports, and symbols this scope " +
+			"exposes that other files reference through an import edge. On-demand diagnostic for a review " +
+			"round, not a mandatory pre-pass. It reports; it does not judge, and it never fails the call — " +
+			"a finding is a question to answer, not a verdict.",
+		promptSnippet: "Inventory the current review scope's join surface (on-demand diagnostic)",
 		parameters: VerifyJoinsParams,
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			const report = buildReport(ctx.cwd);
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const report = buildReport(ctx.cwd, params.baselineHead);
 			last = report;
 			return { content: [{ type: "text", text: render(report) }], details: { report } };
 		},
@@ -520,7 +819,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("verify", {
-		description: "Show this branch's join surface",
+		description: "Show this review scope's join surface",
 		handler: async (_args, ctx) => {
 			const report = buildReport(ctx.cwd);
 			last = report;

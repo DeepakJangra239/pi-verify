@@ -8,6 +8,15 @@ Pinned installs are not moved by `pi update --extensions`. Upgrade deliberately:
 pi install git:github.com/DeepakJangra239/pi-verify@vX.Y.Z
 ```
 
+## [Unreleased]
+
+### Changed
+
+- **Anchored scope.** `buildReport(cwd, baselineHead?)` unions committed-since-baseline + staged/unstaged worktree + untracked files; falls back to merge-base, then worktree-only, then degraded. Reports carry `scope` metadata (kind, range, untracked count, truncation) so staleness is checkable.
+- **Precision.** Join symbols are exports-only (Python top-level def/class; JS/TS `export` forms), callers require an import/require edge, generic names (`data`, `status`, `main`, …) are suppressed, and non-shipped roles (tests, docs, evidence, fixtures — matched generically, overridable via `verify.json`) are withheld and counted, not reported. Ranked (introduced-first, caller count) and capped at 15 with withheld counts.
+- **Shape gating.** Manifest/schedule detectors run only when the repo shows that shape; otherwise one "not applicable" line. Manifest coverage understands ancestor directories (a manifest shipping `static/` covers new fonts inside it). Dependencies extended to `go.mod`, `Cargo.toml`, `pyproject.toml`, `Gemfile`.
+- `verify_joins` is now documented as an on-demand diagnostic (optional `baselineHead` param), not a mandatory review pre-pass.
+
 ## [0.1.1] - 2026-10-03
 
 Fixes false positives found by running this against a real 38-file branch, where 12 of the

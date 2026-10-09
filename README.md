@@ -25,8 +25,20 @@ Docks into [`pi-sidebar`](https://github.com/DeepakJangra239/pi-sidebar) as a se
 
 ## Usage
 
-- `/verify` — this branch's join surface
-- `verify_joins` — the same, as a tool the model calls at the start of a review round
+- `/verify` — this review scope's join surface (anchored at the goal baseline when given)
+- `verify_joins` — the same, as an on-demand diagnostic tool. Takes an optional `baselineHead` (the goal anchor) to scope committed-since-baseline + worktree + untracked instead of the whole branch diff.
+
+## Scope
+
+Anchored, not branch-wide. With a baseline the report unions committed-since-baseline, staged/unstaged worktree, and untracked files; without one it falls back to the merge-base diff, then to a degraded empty report. Every report states the range it covered (`scope.range`), so staleness is checkable.
+
+## Config (`verify.json`)
+
+Non-shipped roles (tests, docs, evidence, fixtures) are matched generically by path role, never by hardcoded directory names. Extend or override in `<repo>/.pi/verify.json` (or the global agent dir):
+
+```json
+{ "excludeRoles": ["(^|/)my-notes?(/|$)"], "includePaths": ["docs/api"] }
+```
 
 ## What it looks for
 

@@ -282,6 +282,126 @@ const { isDeployableArtifact } = await import("../verify.ts");
 	check("NEGATIVE: __init__ is not reported as a join", !d.joinSymbols.some((x) => x.symbol === "__init__"), JSON.stringify(d.joinSymbols));
 }
 
+// ── Anchor scope: worktree, untracked, and baselines ──────────────────────────
+// The scope must cover what the goal did however it was written: committed or
+// not, on one commit or five, via edit tools or by hand. Branch-only diffs miss
+// all of that, so these fixtures exercise the union directly.
+function uncommitted(root: string, files: Record<string, string>): void {
+	const g = (abs: string) => mkdirSync(join(abs, ".."), { recursive: true });
+	for (const [p, b] of Object.entries(files)) {
+		const abs = join(root, p);
+		g(abs);
+		writeFileSync(abs, b);
+	}
+}
+
+{
+	const wt = makeRepo("worktree", { "src/a.py": "def f():\n    return 1\n" }, { "src/a.py": "def f():\n    return 2\n" });
+	uncommitted(wt, { "src/b.py": "def g():\n    return 3\n" });
+	const r = buildReport(wt);
+	check("an uncommitted new file is in scope", r.addedFiles.includes("src/b.py"), JSON.stringify(r.addedFiles));
+	check("an uncommitted new file is a changed file", r.changedFiles.some((c) => c.file === "src/b.py"), JSON.stringify(r.changedFiles.map((c) => c.file)));
+	check("scope is not degraded on worktree content", r.degraded === false, String(r.degraded));
+}
+
+{
+	// Two commits on one branch: the goal baseline isolates the goal's own work.
+	const root = makeRepo("baseline", { "src/a.py": "def f():\n    return 1\n" }, { "src/other.py": "def o():\n    return 1\n" });
+	const shaA = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+	uncommitted(root, { "src/goal.py": "def g():\n    return 1\n" });
+	execFileSync("git", ["add", "-A"], { cwd: root });
+	execFileSync("git", ["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-qm", "goal-work"], { cwd: root });
+	const anchored = buildReport(root, shaA);
+	const files = anchored.changedFiles.map((c) => c.file);
+	check("baseline scope holds the goal commit", files.includes("src/goal.py"), JSON.stringify(files));
+	check("baseline scope excludes pre-goal commits", !files.includes("src/other.py"), JSON.stringify(files));
+	check("baseline scope kind is baseline", anchored.scope.kind === "baseline", anchored.scope.range);
+	const whole = buildReport(root);
+	check("branch fallback still sees the whole branch", whole.changedFiles.some((c) => c.file === "src/other.py"), JSON.stringify(whole.changedFiles.map((c) => c.file)));
+}
+
+// ── Precision: generic names, non-shipped roles, shape gating ────────────────
+{
+	// JS locals and generic exports referenced without an import edge are noise.
+	const js = makeRepo(
+		"genericjs",
+		{ "a.js": "export const widget = 1;\n" },
+		{
+			"a.js": "export const widget = 2;\nexport const data = 1;\n",
+			"b.js": "const data = 1;\nconsole.log(data, status, main);\n",
+		},
+	);
+	const r = buildReport(js);
+	check(
+		"NEGATIVE: generic names without an import edge are not joins",
+		!r.joinSymbols.some((j) => ["data", "status", "main"].includes(j.symbol)),
+		JSON.stringify(r.joinSymbols),
+	);
+	check("NEGATIVE: and produce no external_callers findings", !r.findings.some((f) => f.kind === "external_callers"), JSON.stringify(r.findings));
+
+	const js2 = makeRepo(
+		"jsimport",
+		{ "a.js": "export const widget = 1;\n" },
+		{
+			"a.js": "export const widget = 2;\n",
+			"c.js": "import { widget } from \"./a\";\nconsole.log(widget);\n",
+		},
+	);
+	const c2 = buildReport(js2);
+	check("an importing caller is still reported", c2.joinSymbols.some((j) => j.symbol === "widget" && j.callers.includes("c.js")), JSON.stringify(c2.joinSymbols));
+}
+
+{
+	// Non-shipped roles are withheld by role, not by hardcoded directory names.
+	const ev = makeRepo(
+		"nonshipped",
+		{ "notes/evidence/h.py": "def run_all():\n    return 1\n" },
+		{
+			"notes/evidence/h.py": "def run_all():\n    return 2\n",
+			"checks/t_caller.py": "from h import run_all\n\nprint(run_all())\n",
+		},
+	);
+	const r = buildReport(ev);
+	check("non-shipped definers are withheld, not reported", r.withheldNonShipped > 0 && !r.findings.some((f) => f.kind === "external_callers"), JSON.stringify({ w: r.withheldNonShipped, f: r.findings }));
+}
+
+{
+	// A repo with no manifests or schedules says so in one line — via shape flags.
+	const lib = makeRepo("libshape", { "src/a.py": "def f():\n    return 1\n" }, { "src/a.py": "def f():\n    return 2\n" });
+	const r = buildReport(lib);
+	check("ops detectors stay silent on a library-shaped repo", r.shape.hasManifests === false && r.shape.hasSchedules === false && r.manifestGaps.length === 0 && r.brokenSchedules.length === 0, JSON.stringify(r.shape));
+}
+
+{
+	// A manifest that ships a directory covers new files inside it (fonts-class risk).
+	const covered = makeRepo(
+		"manifestdir",
+		{ "deploy.manifest": "scripts/\n", "scripts/old.sh": "echo old\n" },
+		{ "scripts/new.sh": "echo new\n" },
+	);
+	const r = buildReport(covered);
+	check("NEGATIVE: no manifest gap when the manifest ships the directory", !r.manifestGaps.includes("scripts/new.sh"), JSON.stringify(r.manifestGaps));
+
+	const bare = makeRepo(
+		"manifestbare",
+		{ "deploy.manifest": "other/\n", "scripts/old.sh": "echo old\n" },
+		{ "scripts/new.sh": "echo new\n" },
+	);
+	const rb = buildReport(bare);
+	check("a manifest gap still fires when nothing covers the file", rb.manifestGaps.includes("scripts/new.sh"), JSON.stringify(rb.manifestGaps));
+}
+
+{
+	// Dependencies beyond requirements.txt / package.json.
+	const g = makeRepo(
+		"gomod",
+		{ "go.mod": "module example.com/m\n\ngo 1.21\n", "main.go": "package main\n" },
+		{ "go.mod": "module example.com/m\n\ngo 1.21\n\nrequire example.com/foo v1.0.0\n" },
+	);
+	const r = buildReport(g);
+	check("a go.mod dependency imported nowhere is flagged", r.unreferencedDependencies.some((d) => d.startsWith("example.com/foo")), JSON.stringify(r.unreferencedDependencies));
+}
+
 for (const r of roots) rmSync(r, { recursive: true, force: true });
 
 if (failed > 0) {
